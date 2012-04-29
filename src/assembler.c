@@ -75,7 +75,10 @@ enum token {
     token_iaq,
     token_hwn,
     token_hwq,
-    token_hwi
+    token_hwi,
+    /* Dat */
+    token_dat,
+    token_string
 };
 
 typedef struct token_list {
@@ -122,6 +125,26 @@ static int get_next_char( FILE *fp ) {
         else {
             return tolower((int)i);
         }
+    }
+    else {
+        return EOF;
+    }
+}
+
+/* Buffed char read, sans filtering */
+static int get_next_char_raw( FILE *fp ) {
+    int i;
+    if( charbuf_pos >= CHARBUF_SIZE ) {
+        /* Out of buffer space, time to refill it */
+        i = fread(charbuf, sizeof(char), CHARBUF_SIZE, fp);
+        if( i != CHARBUF_SIZE ) {
+            /* Hit an error/EOF */
+            charbuf_end = i;
+        }
+        charbuf_pos = 0;
+    }
+    if( charbuf_pos < charbuf_end ) {
+        return charbuf[charbuf_pos++];
     }
     else {
         return EOF;
@@ -269,6 +292,34 @@ static token_list * build_token_list_f( FILE *fp ) {
             }
             current_col += ident_pos;
             continue;
+        }
+        /* Strings */
+        else if( curr_char == '\"' ) {
+            ident_pos = 0;
+            curr_char = get_next_char_raw(fp);
+            while( curr_char != '\"' && curr_char != EOF ) {
+                ident_buf[ident_pos] = curr_char;
+                ident_pos++;
+                /* If we get a string longer than the ident buffer, we split it with commas.
+                   Since strings can only exist in DAT fields, this won't change the binary output. */
+                if( ident_pos >= IDENTBUF_SIZE ) {
+                    /* Insert string as ident we change into a string */
+                    result_end->next = build_token_ident(ident_pos, current_line, current_col);
+                    result_end = result_end->next;
+                    result_end->type = token_string;
+                    /* Insert comma */
+                    result_end->next = build_token(token_comma, current_line, current_col);
+                    result_end = result_end->next;
+                    /* Reset ident and keep on keeping on */
+                    current_col += ident_pos;
+                    ident_pos = 0;
+                }
+                curr_char = get_next_char_raw(fp);
+            }
+            result_end->next = build_token_ident(ident_pos, current_line, current_col);
+            result_end = result_end->next;
+            result_end->type = token_string;
+            current_col += ident_pos;
         }
         /* Commas */
         else if( curr_char == ',' ) {
@@ -515,6 +566,8 @@ static void convert_ident_tokens( token_list *tok ) {
     insert_into_trie("hwn",  token_hwn);
     insert_into_trie("hwq",  token_hwq);
     insert_into_trie("hwi",  token_hwi);
+    /* Dat */
+    insert_into_trie("dat",  token_dat);
     /* Step 2: Convert tokens */
     while( tok != NULL ) {
         if( tok->type == token_ident ) {
@@ -964,9 +1017,7 @@ static int parse_bracket( token_list **tp, label_loc_map **utp, enum op_value *v
                 *lit = (*tp)->value;
             }
             else if( (*tp)->type == token_label ) {
-                if( !label_lookup(*tp, *utp) ) {
-                    *utp = insert_into_label_loc_map(*utp, (*tp)->ident, loc, *tp);
-                }
+                *utp = insert_into_label_loc_map(*utp, (*tp)->ident, loc, *tp);
             }
             else {
                 fprintf(stderr, "ERROR: Syntax error: Expected number or label at line %d, column %d.\n",
@@ -1031,9 +1082,7 @@ static int parse_value( token_list **tp, label_loc_map **utp, enum op_value *val
         *val = get_op_value(*tp);
         /* Labels get placeholder values for now, and are later cleaned up */
         if( (*tp)->type == token_label ) {
-            if( !label_lookup(*tp, *utp) ) {
-                *utp = insert_into_label_loc_map(*utp, (*tp)->ident, loc, *tp);
-            }
+            *utp = insert_into_label_loc_map(*utp, (*tp)->ident, loc, *tp);
         }
         /* Have to check if we're given a literal that's larger than 0x1f */
         else if( (*tp)->type == token_number && *val == opv_nw ) {
@@ -1055,7 +1104,7 @@ static int parse_basic( instruction_list *list, token_list **tp, label_loc_map *
         return -1;
     }
     *tp = (*tp)->next;
-    if( parse_value(tp, utp, &val1, &lit1, get_last_instr_loc(list)+1) ) {
+    if( parse_value(tp, utp, &val1, &lit1, get_last_instr_loc(list)+2) ) {
         return -1;
     }
     /* Check for comma */
@@ -1082,13 +1131,17 @@ static int parse_basic( instruction_list *list, token_list **tp, label_loc_map *
     }
     else {
         *tp = (*tp)->next;
-        if( parse_value(tp, utp, &val2, &lit2, get_last_instr_loc(list)+2) ) {
+        if( parse_value(tp, utp, &val2, &lit2, get_last_instr_loc(list)+1) ) {
             return -1;
         }
         list = insert_instruction(list, new_instruction_basic(op, val1, val2));
         /* a is the second value parsed, but the first written out */
         list = insert_literal(list, val2, lit2);
         insert_literal(list, val1, lit1);
+        /* Might need to fix up the update table if 'b' is a next-word value but 'a' isn't */
+        if( *utp && (*utp)->loc > get_last_instr_loc(list) ) {
+            (*utp)->loc--;
+        }
         return 0;
     }
 }
@@ -1113,6 +1166,43 @@ static int parse_nonbasic( instruction_list *list, token_list **tp, label_loc_ma
         insert_literal(list, val, lit);
         return 0;
     }
+}
+
+static int parse_dat( instruction_list *list, token_list **tp, label_loc_map **utp ) {
+    char *c;
+    do {
+        if( !(*tp)->next ) {
+            fprintf(stderr, "ERROR: Syntax error: Unexpected EOF in DAT field after line %d, column %d.\n",
+                    (*tp)->line_number, (*tp)->col_number);
+            return -1;
+        }
+        *tp = (*tp)->next;
+        if( (*tp)->type == token_number ) {
+            insert_instruction(list, new_instruction_literal((*tp)->value));
+        }
+        else if( (*tp)->type == token_label ) {
+            /* We won't know the value until the cleanup, so stick in 0 for now */
+            list = insert_instruction(list, new_instruction_literal(0));
+            *utp = insert_into_label_loc_map(*utp, (*tp)->ident, get_last_instr_loc(list), *tp);
+        }
+        else if( (*tp)->type == token_string ) {
+            c = (*tp)->ident;
+            while( *c ) {
+                insert_instruction(list, new_instruction_literal(*c));
+                c++;
+            }
+        }
+        else {
+            fprintf(stderr, "ERROR: Syntax error: Expected number or label in DAT field at line %d, column %d.\n",
+                    (*tp)->line_number, (*tp)->col_number);
+            return -1;
+        }
+        /* Have to juggle pointers a bit to deal with variable length of dat fields */
+        if( (*tp)->next && (*tp)->next->type == token_comma ) {
+            *tp = (*tp)->next;
+        }
+    } while( *tp && (*tp)->type == token_comma );
+    return 0;
 }
 
 static void free_label_loc_map( label_loc_map *map ) {
@@ -1207,6 +1297,12 @@ static instruction_list * parse( token_list *tok ) {
         case token_hwq:
         case token_hwi:
             if( parse_nonbasic(result, &tok, &update_list) ) {
+                return NULL;
+            }
+            break;
+        /* Deal wit dat */
+        case token_dat:
+            if( parse_dat(result, &tok, &update_list) ) {
                 return NULL;
             }
             break;

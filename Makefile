@@ -20,7 +20,7 @@ getarts= $(wildcard $(call getobjs,$(1)) $(2))
 DASM_O= dasm
 DASM_S= assembler.c
 
-DASM_ARTIFACTS= $(call getarts,$(DASM_S))
+DASM_ARTIFACTS= $(call getarts,$(DASM_S)) $(DASM_O)
 
 all: $(DASM_O)
 
