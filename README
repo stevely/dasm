@@ -1,0 +1,33 @@
+dasm - An assembler for the DCPU
+
+Current target version: 1.7
+
+Goals:
+-No dependencies beyond C standard library and make
+-Fast
+-Descriptive error messages
+
+Includes:
+-Full instruction set
+-Numeric support for hex and decimal
+-DAT fields
+-String support
+-HCF included
+
+Todo:
+-Labels corresponding to values at or under 30 used as part of an A value don't
+ currently get optimized into short-form literals.
+-Escape sequences for strings.
+-Support for binary numbers.
+
+Building:
+ With clang:
+  Go to the root dasm directory and run "make"
+ With gcc:
+  Go to the root dasm directory and run "make gcc"
+
+Notes:
+ Development is done with the clang C compiler and static analyzer. A separate
+build target is included to use gcc instead (make gcc). This target assumes no
+static analyzer. To use clang but skip static analysis (as it can be slow), do
+"make ANALYZER=".
